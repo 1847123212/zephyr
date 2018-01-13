@@ -29,14 +29,17 @@ static void https_disable(struct http_server_ctx *ctx);
 
 #if defined(MBEDTLS_DEBUG_C)
 #include <mbedtls/debug.h>
+/* - Debug levels (from ext/lib/crypto/mbedtls/include/mbedtls/debug.h)
+ *    - 0 No debug
+ *    - 1 Error
+ *    - 2 State change
+ *    - 3 Informational
+ *    - 4 Verbose
+ */
 #define DEBUG_THRESHOLD 0
 #endif
 
-#if defined(MBEDTLS_MEMORY_BUFFER_ALLOC_C)
-#include <mbedtls/memory_buffer_alloc.h>
-static unsigned char heap[CONFIG_HTTPS_HEAP_SIZE];
-#endif
-#endif
+#endif /* CONFIG_HTTPS */
 
 #define HTTP_DEFAULT_PORT  80
 #define HTTPS_DEFAULT_PORT 443
@@ -56,6 +59,46 @@ static unsigned char heap[CONFIG_HTTPS_HEAP_SIZE];
 
 #define HTTP_STATUS_404_NF	"HTTP/1.1 404 Not Found\r\n" \
 				"\r\n"
+
+#if defined(CONFIG_NET_DEBUG_HTTP_CONN)
+/** List of HTTP connections */
+static sys_slist_t http_conn;
+
+static http_server_cb_t ctx_mon;
+static void *mon_user_data;
+
+static void http_server_conn_add(struct http_server_ctx *ctx)
+{
+	sys_slist_prepend(&http_conn, &ctx->node);
+
+	if (ctx_mon) {
+		ctx_mon(ctx, mon_user_data);
+	}
+}
+
+static void http_server_conn_del(struct http_server_ctx *ctx)
+{
+	sys_slist_find_and_remove(&http_conn, &ctx->node);
+}
+
+void http_server_conn_foreach(http_server_cb_t cb, void *user_data)
+{
+	struct http_server_ctx *ctx;
+
+	SYS_SLIST_FOR_EACH_CONTAINER(&http_conn, ctx, node) {
+		cb(ctx, user_data);
+	}
+}
+
+void http_server_conn_monitor(http_server_cb_t cb, void *user_data)
+{
+	ctx_mon = cb;
+	mon_user_data = user_data;
+}
+#else
+#define http_server_conn_add(...)
+#define http_server_conn_del(...)
+#endif /* CONFIG_NET_DEBUG_HTTP_CONN */
 
 static inline u16_t http_strlen(const char *str)
 {
@@ -107,17 +150,54 @@ static int http_add_chunk(struct net_pkt *pkt, s32_t timeout, const char *str)
 	return 0;
 }
 
+static void req_timer_cancel(struct http_server_ctx *ctx)
+{
+	k_delayed_work_cancel(&ctx->req.timer);
+
+	NET_DBG("Context %p request timer cancelled", ctx);
+}
+
+static void req_timeout(struct k_work *work)
+{
+	struct http_server_ctx *ctx = CONTAINER_OF(work,
+						   struct http_server_ctx,
+						   req.timer);
+
+	NET_DBG("Context %p request timeout", ctx);
+
+	net_context_put(ctx->req.net_ctx);
+	ctx->req.net_ctx = NULL;
+
+	http_server_conn_del(ctx);
+}
+
 static void pkt_sent(struct net_context *context,
 		     int status,
 		     void *token,
 		     void *user_data)
 {
-	/* We can just close the context after the packet is sent. */
-	net_context_unref(context);
+	s32_t timeout = POINTER_TO_INT(token);
+	struct http_server_ctx *ctx = user_data;
+
+	req_timer_cancel(ctx);
+
+	if (timeout == K_NO_WAIT) {
+		/* We can just close the context after the packet is sent. */
+		net_context_put(context);
+		http_server_conn_del(ctx);
+	} else if (timeout > 0) {
+		NET_DBG("Context %p starting timer", ctx);
+
+		k_delayed_work_submit(&ctx->req.timer, timeout);
+	}
+
+	/* Note that if the timeout is K_FOREVER, we do not close
+	 * the connection.
+	 */
 }
 
-int http_response(struct http_server_ctx *ctx, const char *http_header,
-		  const char *html_payload)
+int http_response_wait(struct http_server_ctx *ctx, const char *http_header,
+		       const char *html_payload, s32_t timeout)
 {
 	struct net_pkt *pkt;
 	int ret = -EINVAL;
@@ -147,7 +227,7 @@ int http_response(struct http_server_ctx *ctx, const char *http_header,
 
 	net_pkt_set_appdatalen(pkt, net_buf_frags_len(pkt->frags));
 
-	ret = ctx->send_data(pkt, pkt_sent, 0, NULL, ctx);
+	ret = ctx->send_data(pkt, pkt_sent, 0, INT_TO_POINTER(timeout), ctx);
 	if (ret != 0) {
 		goto exit_routine;
 	}
@@ -160,6 +240,12 @@ exit_routine:
 	}
 
 	return ret;
+}
+
+int http_response(struct http_server_ctx *ctx, const char *http_header,
+		  const char *html_payload)
+{
+	return http_response_wait(ctx, http_header, html_payload, K_NO_WAIT);
 }
 
 int http_response_400(struct http_server_ctx *ctx, const char *html_payload)
@@ -177,6 +263,54 @@ int http_response_404(struct http_server_ctx *ctx, const char *html_payload)
 	return http_response(ctx, HTTP_STATUS_404_NF, html_payload);
 }
 
+int http_response_send_data(struct http_server_ctx *ctx,
+			    const char *http_header,
+			    const char *html_payload,
+			    s32_t timeout)
+{
+	struct net_pkt *pkt;
+	int ret = -EINVAL;
+
+	pkt = net_pkt_get_tx(ctx->req.net_ctx, ctx->timeout);
+	if (!pkt) {
+		return ret;
+	}
+
+	if (http_header) {
+		ret = http_add_header(pkt, ctx->timeout, http_header);
+		if (ret != 0) {
+			goto exit_routine;
+		}
+	}
+
+	ret = http_add_chunk(pkt, ctx->timeout, html_payload);
+	if (ret != 0) {
+		goto exit_routine;
+	}
+
+	net_pkt_set_appdatalen(pkt, net_buf_frags_len(pkt->frags));
+
+	ret = ctx->send_data(pkt, pkt_sent, 0, INT_TO_POINTER(timeout), ctx);
+	if (ret != 0) {
+		goto exit_routine;
+	}
+
+	pkt = NULL;
+
+	/* We must let the system to send the packet, otherwise TCP might
+	 * timeout before the packet is actually sent. This is easily seen
+	 * if the application calls this functions many times in a row.
+	 */
+	k_yield();
+
+exit_routine:
+	if (pkt) {
+		net_pkt_unref(pkt);
+	}
+
+	return ret;
+}
+
 int http_server_set_local_addr(struct sockaddr *addr, const char *myaddr,
 			       u16_t port)
 {
@@ -187,14 +321,14 @@ int http_server_set_local_addr(struct sockaddr *addr, const char *myaddr,
 	if (myaddr) {
 		void *inaddr;
 
-		if (addr->family == AF_INET) {
+		if (addr->sa_family == AF_INET) {
 #if defined(CONFIG_NET_IPV4)
 			inaddr = &net_sin(addr)->sin_addr;
 			net_sin(addr)->sin_port = htons(port);
 #else
 			return -EPFNOSUPPORT;
 #endif
-		} else if (addr->family == AF_INET6) {
+		} else if (addr->sa_family == AF_INET6) {
 #if defined(CONFIG_NET_IPV6)
 			inaddr = &net_sin6(addr)->sin6_addr;
 			net_sin6(addr)->sin6_port = htons(port);
@@ -205,13 +339,13 @@ int http_server_set_local_addr(struct sockaddr *addr, const char *myaddr,
 			return -EAFNOSUPPORT;
 		}
 
-		return net_addr_pton(addr->family, myaddr, inaddr);
+		return net_addr_pton(addr->sa_family, myaddr, inaddr);
 	}
 
 	/* If the caller did not supply the address where to bind, then
 	 * try to figure it out ourselves.
 	 */
-	if (addr->family == AF_INET6) {
+	if (addr->sa_family == AF_INET6) {
 #if defined(CONFIG_NET_IPV6)
 		net_ipaddr_copy(&net_sin6(addr)->sin6_addr,
 				net_if_ipv6_select_src_addr(NULL,
@@ -220,7 +354,7 @@ int http_server_set_local_addr(struct sockaddr *addr, const char *myaddr,
 #else
 		return -EPFNOSUPPORT;
 #endif
-	} else if (addr->family == AF_INET) {
+	} else if (addr->sa_family == AF_INET) {
 #if defined(CONFIG_NET_IPV4)
 		struct net_if *iface = net_if_get_default();
 
@@ -312,21 +446,21 @@ int http_server_del_default(struct http_server_urls *my)
 #if defined(CONFIG_NET_DEBUG_HTTP) && (CONFIG_SYS_LOG_NET_LEVEL > 2)
 static char *sprint_ipaddr(char *buf, int buflen, const struct sockaddr *addr)
 {
-	if (addr->family == AF_INET6) {
+	if (addr->sa_family == AF_INET6) {
 #if defined(CONFIG_NET_IPV6)
 		char ipaddr[NET_IPV6_ADDR_LEN];
 
-		net_addr_ntop(addr->family,
+		net_addr_ntop(addr->sa_family,
 			      &net_sin6(addr)->sin6_addr,
 			      ipaddr, sizeof(ipaddr));
 		snprintk(buf, buflen, "[%s]:%u", ipaddr,
 			 ntohs(net_sin6(addr)->sin6_port));
 #endif
-	} else if (addr->family == AF_INET) {
+	} else if (addr->sa_family == AF_INET) {
 #if defined(CONFIG_NET_IPV4)
 		char ipaddr[NET_IPV4_ADDR_LEN];
 
-		net_addr_ntop(addr->family,
+		net_addr_ntop(addr->sa_family,
 			      &net_sin(addr)->sin_addr,
 			      ipaddr, sizeof(ipaddr));
 		snprintk(buf, buflen, "%s:%u", ipaddr,
@@ -418,6 +552,8 @@ static int on_url(struct http_parser *parser, const char *at, size_t length)
 
 	ctx->req.url = at;
 	ctx->req.url_len = length;
+
+	http_server_conn_add(ctx);
 
 	return 0;
 }
@@ -624,6 +760,8 @@ fail:
 	}
 
 quit:
+	http_parser_init(&http_ctx->req.parser, HTTP_REQUEST);
+	http_ctx->req.field_values_ctr = 0;
 	http_ctx->req.data_len = 0;
 	net_pkt_unref(pkt);
 }
@@ -633,6 +771,7 @@ static void accept_cb(struct net_context *net_ctx,
 		      int status, void *data)
 {
 	struct http_server_ctx *http_ctx = data;
+	int ret;
 
 	ARG_UNUSED(addr);
 	ARG_UNUSED(addrlen);
@@ -642,11 +781,28 @@ static void accept_cb(struct net_context *net_ctx,
 		return;
 	}
 
+	/* If we receive a HTTP request and if the earlier context is still
+	 * active and it is not the same as the new one, then close the earlier
+	 * one. Otherwise it is possible that the context will be left into
+	 * TCP ESTABLISHED state and would never be released. Example of this
+	 * is that we had IPv4 connection active and then IPv6 connection is
+	 * established, in this case we disconnect the IPv4 here.
+	 */
+	if (http_ctx->req.net_ctx && http_ctx->req.net_ctx != net_ctx &&
+	    net_context_get_state(http_ctx->req.net_ctx) ==
+						      NET_CONTEXT_CONNECTED) {
+		net_context_put(http_ctx->req.net_ctx);
+	}
+
 	http_ctx->req.net_ctx = net_ctx;
 
 	new_client(http_ctx, net_ctx, addr);
 
-	net_context_recv(net_ctx, http_ctx->recv_cb, K_NO_WAIT, http_ctx);
+	ret = net_context_recv(net_ctx, http_ctx->recv_cb, K_NO_WAIT,
+			       http_ctx);
+	if (ret < 0) {
+		NET_DBG("Cannot set recv_cb (%d)", ret);
+	}
 }
 
 static int set_net_ctx(struct http_server_ctx *http_ctx,
@@ -668,7 +824,7 @@ static int set_net_ctx(struct http_server_ctx *http_ctx,
 		goto out;
 	}
 
-	ret = net_context_accept(ctx, accept_cb, 0, http_ctx);
+	ret = net_context_accept(ctx, accept_cb, K_NO_WAIT, http_ctx);
 	if (ret < 0) {
 		NET_ERR("Cannot accept context (%d)", ret);
 		goto out;
@@ -695,8 +851,11 @@ static int setup_ipv4_ctx(struct http_server_ctx *http_ctx,
 		return ret;
 	}
 
-	if (addr->family == AF_UNSPEC) {
-		addr->family = AF_INET;
+	net_context_setup_pools(http_ctx->net_ipv4_ctx, http_ctx->tx_slab,
+				http_ctx->data_pool);
+
+	if (addr->sa_family == AF_UNSPEC) {
+		addr->sa_family = AF_INET;
 
 		http_server_set_local_addr(addr, NULL,
 					   net_sin(addr)->sin_port);
@@ -729,8 +888,11 @@ int setup_ipv6_ctx(struct http_server_ctx *http_ctx, struct sockaddr *addr)
 		return ret;
 	}
 
-	if (addr->family == AF_UNSPEC) {
-		addr->family = AF_INET6;
+	net_context_setup_pools(http_ctx->net_ipv6_ctx, http_ctx->tx_slab,
+				http_ctx->data_pool);
+
+	if (addr->sa_family == AF_UNSPEC) {
+		addr->sa_family = AF_INET6;
 
 		http_server_set_local_addr(addr, NULL,
 					   net_sin6(addr)->sin6_port);
@@ -759,30 +921,30 @@ static int init_net(struct http_server_ctx *ctx,
 	if (server_addr) {
 		memcpy(&addr, server_addr, sizeof(addr));
 	} else {
-		addr.family = AF_UNSPEC;
+		addr.sa_family = AF_UNSPEC;
 		net_sin(&addr)->sin_port = htons(port);
 	}
 
-	if (addr.family == AF_INET6) {
+	if (addr.sa_family == AF_INET6) {
 #if defined(CONFIG_NET_IPV6)
 		ret = setup_ipv6_ctx(ctx, &addr);
 #else
 		return -EPFNOSUPPORT;
 #endif
-	} else if (addr.family == AF_INET) {
+	} else if (addr.sa_family == AF_INET) {
 #if defined(CONFIG_NET_IPV4)
 		ret = setup_ipv4_ctx(ctx, &addr);
 #else
 		return -EPFNOSUPPORT;
 #endif
-	} else if (addr.family == AF_UNSPEC) {
+	} else if (addr.sa_family == AF_UNSPEC) {
 #if defined(CONFIG_NET_IPV4)
 		ret = setup_ipv4_ctx(ctx, &addr);
 #endif
 		/* We ignore the IPv4 error if IPv6 is enabled */
 #if defined(CONFIG_NET_IPV6)
 		memset(&addr, 0, sizeof(addr));
-		addr.family = AF_UNSPEC;
+		addr.sa_family = AF_UNSPEC;
 		net_sin6(&addr)->sin6_port = htons(port);
 
 		ret = setup_ipv6_ctx(ctx, &addr);
@@ -817,6 +979,8 @@ bool http_server_disable(struct http_server_ctx *http_ctx)
 	bool old;
 
 	NET_ASSERT(http_ctx);
+
+	req_timer_cancel(http_ctx);
 
 	old = http_ctx->enabled;
 
@@ -865,6 +1029,8 @@ int http_server_init(struct http_server_ctx *http_ctx,
 	http_ctx->recv_cb = http_recv;
 	http_ctx->send_data = net_context_send;
 
+	k_delayed_work_init(&http_ctx->req.timer, req_timeout);
+
 	parser_init(http_ctx);
 
 	return 0;
@@ -907,6 +1073,7 @@ static void my_debug(void *ctx, int level,
 		     const char *file, int line, const char *str)
 {
 	const char *p, *basename;
+	int len;
 
 	ARG_UNUSED(ctx);
 
@@ -916,6 +1083,12 @@ static void my_debug(void *ctx, int level,
 			basename = p + 1;
 		}
 
+	}
+
+	/* Avoid printing double newlines */
+	len = strlen(str);
+	if (str[len - 1] == '\n') {
+		((char *)str)[len - 1] = '\0';
 	}
 
 	NET_DBG("%s:%04d: |%d| %s", basename, line, level, str);
@@ -956,11 +1129,7 @@ static void ssl_received(struct net_context *context,
 	ARG_UNUSED(context);
 	ARG_UNUSED(status);
 
-	if (!pkt) {
-		return;
-	}
-
-	if (!net_pkt_appdatalen(pkt)) {
+	if (pkt && !net_pkt_appdatalen(pkt)) {
 		net_pkt_unref(pkt);
 		return;
 	}
@@ -997,6 +1166,11 @@ static int ssl_rx(void *context, unsigned char *buf, size_t size)
 	if (!ctx->https.mbedtls.ssl_ctx.frag) {
 		rx_data = k_fifo_get(&ctx->https.mbedtls.ssl_ctx.rx_fifo,
 				     K_FOREVER);
+		if (!rx_data->pkt) {
+			NET_DBG("Closing %p connection", ctx);
+			k_mem_pool_free(&rx_data->block);
+			return -EIO;
+		}
 
 		ctx->https.mbedtls.ssl_ctx.rx_pkt = rx_data->pkt;
 
@@ -1197,22 +1371,12 @@ static int https_send(struct net_pkt *pkt,
 	} while (ret <= 0);
 
 out:
+	if (cb) {
+		cb(net_pkt_context(pkt), ret, token, user_data);
+	}
+
 	return ret;
 }
-
-#if defined(MBEDTLS_MEMORY_BUFFER_ALLOC_C)
-static void heap_init(struct http_server_ctx *ctx)
-{
-	static bool heap_init;
-
-	if (!heap_init) {
-		mbedtls_memory_buffer_alloc_init(heap, sizeof(heap));
-		heap_init = true;
-	}
-}
-#else
-#define heap_init(...)
-#endif
 
 static void https_handler(struct http_server_ctx *ctx)
 {
@@ -1223,13 +1387,6 @@ static void https_handler(struct http_server_ctx *ctx)
 
 	mbedtls_platform_set_printf(printk);
 
-	heap_init(ctx);
-
-#if defined(MBEDTLS_DEBUG_C) && defined(CONFIG_NET_DEBUG_HTTP)
-	mbedtls_debug_set_threshold(DEBUG_THRESHOLD);
-	mbedtls_ssl_conf_dbg(&ctx->https.mbedtls.conf, my_debug, NULL);
-#endif
-
 #if defined(MBEDTLS_X509_CRT_PARSE_C)
 	mbedtls_x509_crt_init(&ctx->https.mbedtls.srvcert);
 #endif
@@ -1239,6 +1396,11 @@ static void https_handler(struct http_server_ctx *ctx)
 	mbedtls_ssl_config_init(&ctx->https.mbedtls.conf);
 	mbedtls_entropy_init(&ctx->https.mbedtls.entropy);
 	mbedtls_ctr_drbg_init(&ctx->https.mbedtls.ctr_drbg);
+
+#if defined(MBEDTLS_DEBUG_C) && defined(CONFIG_NET_DEBUG_HTTP)
+	mbedtls_debug_set_threshold(DEBUG_THRESHOLD);
+	mbedtls_ssl_conf_dbg(&ctx->https.mbedtls.conf, my_debug, NULL);
+#endif
 
 	/* Load the certificates and private RSA key. This needs to be done
 	 * by the user so we call a callback that user must have provided.
@@ -1319,8 +1481,6 @@ reset:
 		if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
 		    ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
 			if (ret < 0) {
-				print_error("mbedtls_ssl_handshake returned "
-					    "-0x%x", ret);
 				goto reset;
 			}
 		}
@@ -1374,7 +1534,11 @@ reset:
 	}
 
 close:
+	http_parser_init(&ctx->req.parser, HTTP_REQUEST);
+	ctx->req.field_values_ctr = 0;
+
 	mbedtls_ssl_close_notify(&ctx->https.mbedtls.ssl);
+
 	goto reset;
 
 exit:
@@ -1459,7 +1623,7 @@ int https_server_init(struct http_server_ctx *ctx,
 		      https_server_cert_cb_t cert_cb,
 		      https_entropy_src_cb_t entropy_src_cb,
 		      struct k_mem_pool *pool,
-		      u8_t *https_stack,
+		      k_thread_stack_t *https_stack,
 		      size_t https_stack_size)
 {
 	int ret;
@@ -1509,9 +1673,23 @@ int https_server_init(struct http_server_ctx *ctx,
 	ctx->send_data = https_send;
 	ctx->recv_cb = ssl_received;
 
+	k_delayed_work_init(&ctx->req.timer, req_timeout);
+
 	parser_init(ctx);
 
 	/* Then mbedtls specific initialization */
 	return https_init(ctx);
 }
 #endif /* CONFIG_HTTPS */
+
+#if defined(CONFIG_NET_CONTEXT_NET_PKT_POOL)
+int http_server_set_net_pkt_pool(struct http_server_ctx *ctx,
+				 net_pkt_get_slab_func_t tx_slab,
+				 net_pkt_get_pool_func_t data_pool)
+{
+	ctx->tx_slab = tx_slab;
+	ctx->data_pool = data_pool;
+
+	return 0;
+}
+#endif /* CONFIG_NET_CONTEXT_NET_PKT_POOL */

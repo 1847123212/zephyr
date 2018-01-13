@@ -12,10 +12,12 @@
  * init time. If no routine is installed, a nop routine is called.
  */
 
+#include <kernel.h>
 #include <misc/printk.h>
 #include <stdarg.h>
 #include <toolchain.h>
-#include <sections.h>
+#include <linker/sections.h>
+#include <syscall_handler.h>
 
 typedef int (*out_func_t)(int c, void *ctx);
 
@@ -90,6 +92,7 @@ void _vprintk(out_func_t out, void *ctx, const char *fmt, va_list ap)
 	int might_format = 0; /* 1 if encountered a '%' */
 	enum pad_type padding = PAD_NONE;
 	int min_width = -1;
+	int long_ctr = 0;
 
 	/* fmt has already been adjusted if needed */
 
@@ -101,6 +104,7 @@ void _vprintk(out_func_t out, void *ctx, const char *fmt, va_list ap)
 				might_format = 1;
 				min_width = -1;
 				padding = PAD_NONE;
+				long_ctr = 0;
 			}
 		} else {
 			switch (*fmt) {
@@ -124,14 +128,21 @@ void _vprintk(out_func_t out, void *ctx, const char *fmt, va_list ap)
 					padding = PAD_SPACE_BEFORE;
 				}
 				goto still_might_format;
-			case 'z':
 			case 'l':
+				long_ctr++;
+				/* Fall through */
+			case 'z':
 			case 'h':
 				/* FIXME: do nothing for these modifiers */
 				goto still_might_format;
 			case 'd':
 			case 'i': {
-				long d = va_arg(ap, long);
+				long d;
+				if (long_ctr < 2) {
+					d = va_arg(ap, long);
+				} else {
+					d = (long)va_arg(ap, long long);
+				}
 
 				if (d < 0) {
 					out((int)'-', ctx);
@@ -143,8 +154,14 @@ void _vprintk(out_func_t out, void *ctx, const char *fmt, va_list ap)
 				break;
 			}
 			case 'u': {
-				unsigned long u = va_arg(
-					ap, unsigned long);
+				unsigned long u;
+
+				if (long_ctr < 2) {
+					u = va_arg(ap, unsigned long);
+				} else {
+					u = (unsigned long)va_arg(ap,
+							unsigned long long);
+				}
 				_printk_dec_ulong(out, ctx, u, padding,
 						  min_width);
 				break;
@@ -158,17 +175,32 @@ void _vprintk(out_func_t out, void *ctx, const char *fmt, va_list ap)
 				  /* Fall through */
 			case 'x':
 			case 'X': {
-				unsigned long x = va_arg(
-					ap, unsigned long);
+				unsigned long x;
+
+				if (long_ctr < 2) {
+					x = va_arg(ap, unsigned long);
+				} else {
+					x = (unsigned long)va_arg(ap,
+							unsigned long long);
+				}
+
 				_printk_hex_ulong(out, ctx, x, padding,
 						  min_width);
 				break;
 			}
 			case 's': {
 				char *s = va_arg(ap, char *);
+				char *start = s;
 
 				while (*s)
 					out((int)(*s++), ctx);
+
+				if (padding == PAD_SPACE_AFTER) {
+					int remaining = min_width - (s - start);
+					while (remaining-- > 0) {
+						out(' ', ctx);
+					}
+				}
 				break;
 			}
 			case 'c': {
@@ -193,23 +225,94 @@ still_might_format:
 	}
 }
 
+#ifdef CONFIG_USERSPACE
+struct buf_out_context {
+	int count;
+	unsigned int buf_count;
+	char buf[CONFIG_PRINTK_BUFFER_SIZE];
+};
+
+static void buf_flush(struct buf_out_context *ctx)
+{
+	k_str_out(ctx->buf, ctx->buf_count);
+	ctx->buf_count = 0;
+}
+
+static int buf_char_out(int c, void *ctx_p)
+{
+	struct buf_out_context *ctx = ctx_p;
+
+	ctx->count++;
+	ctx->buf[ctx->buf_count++] = c;
+	if (ctx->buf_count == CONFIG_PRINTK_BUFFER_SIZE) {
+		buf_flush(ctx);
+	}
+
+	return c;
+}
+#endif /* CONFIG_USERSPACE */
+
 struct out_context {
 	int count;
 };
 
-static int char_out(int c, struct out_context *ctx)
+static int char_out(int c, void *ctx_p)
 {
+	struct out_context *ctx = ctx_p;
+
 	ctx->count++;
 	return _char_out(c);
 }
 
+#ifdef CONFIG_USERSPACE
+int vprintk(const char *fmt, va_list ap)
+{
+	if (_is_user_context()) {
+		struct buf_out_context ctx = { 0 };
+
+		_vprintk(buf_char_out, &ctx, fmt, ap);
+
+		if (ctx.buf_count) {
+			buf_flush(&ctx);
+		}
+		return ctx.count;
+	} else {
+		struct out_context ctx = { 0 };
+
+		_vprintk(char_out, &ctx, fmt, ap);
+
+		return ctx.count;
+	}
+}
+#else
 int vprintk(const char *fmt, va_list ap)
 {
 	struct out_context ctx = { 0 };
 
-	_vprintk((out_func_t)char_out, &ctx, fmt, ap);
+	_vprintk(char_out, &ctx, fmt, ap);
+
 	return ctx.count;
 }
+#endif
+
+void _impl_k_str_out(char *c, size_t n)
+{
+	int i;
+
+	for (i = 0; i < n; i++) {
+		_char_out(c[i]);
+	}
+}
+
+#ifdef CONFIG_USERSPACE
+_SYSCALL_HANDLER(k_str_out, c, n)
+{
+	_SYSCALL_MEMORY_READ(c, n);
+	_impl_k_str_out((char *)c, n);
+
+	return 0;
+}
+#endif
 
 /**
  * @brief Output a string

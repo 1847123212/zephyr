@@ -71,6 +71,7 @@ enum net_ipv6_nbr_state {
 	NET_IPV6_NBR_STATE_STALE,
 	NET_IPV6_NBR_STATE_DELAY,
 	NET_IPV6_NBR_STATE_PROBE,
+	NET_IPV6_NBR_STATE_STATIC,
 };
 
 const char *net_ipv6_nbr_state2str(enum net_ipv6_nbr_state state);
@@ -88,7 +89,7 @@ struct net_ipv6_nbr_data {
 	/** Reachable timer. */
 	struct k_delayed_work reachable;
 
-	/** Neighbor Solicitation timer for DAD */
+	/** Neighbor Solicitation reply timer */
 	struct k_delayed_work send_ns;
 
 	/** State of the neighbor discovery */
@@ -129,8 +130,8 @@ int net_ipv6_send_ns(struct net_if *iface, struct net_pkt *pending,
 int net_ipv6_send_rs(struct net_if *iface);
 int net_ipv6_start_rs(struct net_if *iface);
 
-int net_ipv6_send_na(struct net_if *iface, struct in6_addr *src,
-		     struct in6_addr *dst, struct in6_addr *tgt,
+int net_ipv6_send_na(struct net_if *iface, const struct in6_addr *src,
+		     const struct in6_addr *dst, const struct in6_addr *tgt,
 		     u8_t flags);
 
 /**
@@ -374,7 +375,9 @@ static inline void net_ipv6_nbr_set_reachable_timer(struct net_if *iface,
  * This means that we should receive everything within first two fragments.
  * The first one being 1280 bytes and the second one 220 bytes.
  */
+#if !defined(NET_IPV6_FRAGMENTS_MAX_PKT)
 #define NET_IPV6_FRAGMENTS_MAX_PKT 2
+#endif
 
 /** Store pending IPv6 fragment information that is needed for reassembly. */
 struct net_ipv6_reassembly {
@@ -421,11 +424,15 @@ void net_ipv6_frag_foreach(net_ipv6_frag_cb_t cb, void *user_data);
  * @brief Find the last IPv6 extension header in the network packet.
  *
  * @param pkt Network head packet.
+ * @param next_hdr_idx Where is the index to next header field that points
+ * to last header. This is returned to caller.
+ * @param last_hdr_idx Where is the last header field in the packet.
+ * This is returned to caller.
  *
- * @return Offset to the extension header within the first fragment of net_pkt.
- * Return <0 if the packet is malformed.
+ * @return Return 0 if ok or <0 if the packet is malformed.
  */
-int net_ipv6_find_last_ext_hdr(struct net_pkt *pkt);
+int net_ipv6_find_last_ext_hdr(struct net_pkt *pkt, u16_t *next_hdr_idx,
+			       u16_t *last_hdr_idx);
 
 #if defined(CONFIG_NET_IPV6)
 void net_ipv6_init(void);

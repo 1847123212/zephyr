@@ -11,11 +11,11 @@
 #include <drivers/console/console.h>
 #include <drivers/console/uart_console.h>
 
-#if CONFIG_CONSOLE_GETCHAR_BUFSIZE & (CONFIG_CONSOLE_GETCHAR_BUFSIZE - 1) != 0
+#if (CONFIG_CONSOLE_GETCHAR_BUFSIZE & (CONFIG_CONSOLE_GETCHAR_BUFSIZE - 1)) != 0
 #error CONFIG_CONSOLE_GETCHAR_BUFSIZE must be power of 2
 #endif
 
-#if CONFIG_CONSOLE_PUTCHAR_BUFSIZE & (CONFIG_CONSOLE_PUTCHAR_BUFSIZE - 1) != 0
+#if (CONFIG_CONSOLE_PUTCHAR_BUFSIZE & (CONFIG_CONSOLE_PUTCHAR_BUFSIZE - 1)) != 0
 #error CONFIG_CONSOLE_PUTCHAR_BUFSIZE must be power of 2
 #endif
 
@@ -36,7 +36,7 @@ static void uart_isr(struct device *dev)
 	uart_irq_update(dev);
 
 	if (uart_irq_rx_ready(dev)) {
-		char c;
+		u8_t c;
 
 		while (1) {
 			if (uart_fifo_read(dev, &c, 1) == 0) {
@@ -89,7 +89,7 @@ int console_putchar(char c)
 		return -1;
 	}
 
-	tx_ringbuf[tx_put] = c;
+	tx_ringbuf[tx_put] = (u8_t)c;
 	tx_put = tx_next;
 
 	irq_unlock(key);

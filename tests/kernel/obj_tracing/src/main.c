@@ -7,6 +7,7 @@
  */
 
 #include <zephyr.h>
+#include <ztest.h>
 #include "phil.h"
 
 #define STSIZE 1024
@@ -14,19 +15,19 @@
 extern void phil_entry(void);
 extern void object_monitor(void);
 
-char __stack phil_stack[N_PHILOSOPHERS][STSIZE];
+K_THREAD_STACK_ARRAY_DEFINE(phil_stack, N_PHILOSOPHERS, STSIZE);
 static struct k_thread phil_data[N_PHILOSOPHERS];
-char __stack mon_stack[STSIZE];
+K_THREAD_STACK_DEFINE(mon_stack, STSIZE);
 static struct k_thread mon_data;
 struct k_sem forks[N_PHILOSOPHERS];
 
-int main(void)
+K_SEM_DEFINE(f3, -5, 1);
+void test_tracing(void)
 {
 	int i;
 
 	for (i = 0; i < N_PHILOSOPHERS; i++) {
-		k_sem_init(&forks[i], 0, 1);
-		k_sem_give(&forks[i]);
+		k_sem_init(&forks[i], 1, 1);
 	}
 
 	/* create philosopher threads */
@@ -40,6 +41,11 @@ int main(void)
 	k_thread_create(&mon_data, mon_stack, STSIZE,
 			(k_thread_entry_t)object_monitor, NULL, NULL, NULL,
 			K_PRIO_COOP(7), 0, K_NO_WAIT);
+}
 
-	return 0;
+void test_main(void)
+{
+	ztest_test_suite(test_obj_tracing,
+			ztest_unit_test(test_tracing));
+	ztest_run_test_suite(test_obj_tracing);
 }
